@@ -213,10 +213,17 @@ async def get_generation_status(ad_id: str):
 
 @app.get("/api/files/{filename}")
 async def get_file(filename: str):
-    """Serve uploaded files"""
+    """Serve uploaded files and generated clips"""
+    # 1. Check uploads folder
     file_path = os.path.join("uploads", filename)
     if os.path.exists(file_path):
         return FileResponse(file_path)
+    
+    # 2. Check clips folder (Added this check)
+    file_path = os.path.join("clips", filename)
+    if os.path.exists(file_path):
+        return FileResponse(file_path)
+        
     raise HTTPException(status_code=404, detail="File not found")
 
 

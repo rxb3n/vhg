@@ -415,120 +415,83 @@ class VideoGenerator:
                 print(f"WARNING: Wan API error: {e}. Creating placeholder video...")
                 return self._create_placeholder_video(clip_id)
     
-    async def _poll_wan_task(self, task_id: str, clip_id: str) -> str:
-        """Poll Alibaba Model Studio Wan 2.6 task until completion"""
+    async def _poll_wan_task(self, task_id, clip_id):
+        """
+        Polls the Wan API for task status and downloads result on success.
+        """
         print(f"DEBUG: _poll_wan_task started for task {task_id}, clip {clip_id}")
+        
+        # Determine base host for polling
+        if "dashscope-intl" in self.wan_api_url:
+            base_host = "https://dashscope-intl.aliyuncs.com"
+        else:
+            base_host = "https://dashscope.aliyuncs.com"
+            
+        query_url = f"{base_host}/api/v1/tasks/{task_id}"
+
         headers = {
             "Authorization": f"Bearer {self.wan_api_key}",
             "Content-Type": "application/json"
         }
-        
-        max_attempts = 120  # 10 minutes max (120 * 5 seconds)
-        attempt = 0
-        print(f"DEBUG: Will poll up to {max_attempts} times (5 seconds between attempts)")
-        
-        # Get model name for query request
-        model_name = os.getenv("WAN_MODEL_NAME", "wan2.6-i2v")
-        
-        # Alibaba uses a query task endpoint
-        # The query endpoint is typically at the same base path with /query
-        # Handle both /generation and /video-synthesis endpoints
-        if "/video-synthesis" in self.wan_api_url:
-            base_url = self.wan_api_url.replace("/video-synthesis", "")
-        elif "/generation" in self.wan_api_url:
-            base_url = self.wan_api_url.replace("/generation", "")
-        else:
-            # Fallback: try to construct from known patterns
-            base_url = self.wan_api_url.rsplit("/", 1)[0] if "/" in self.wan_api_url else self.wan_api_url
-        
-        query_url = f"{base_url}/query"
-        print(f"Querying task status at: {query_url}")
-        
-        while attempt < max_attempts:
+
+        print("DEBUG: Will poll up to 120 times (5 seconds between attempts)")
+        for i in range(120):
             try:
-                # Check task status - Alibaba format (requires model parameter)
-                payload = {
-                    "model": model_name,
-                    "task_id": task_id
-                }
-                print(f"DEBUG: Polling attempt {attempt + 1}/{max_attempts} - checking task {task_id}")
-                print(f"DEBUG: Query URL: {query_url}")
-                print(f"DEBUG: Payload: {json.dumps(payload, indent=2)}")
-                response = requests.post(query_url, json=payload, headers=headers, timeout=30)
-                print(f"DEBUG: Poll response status: {response.status_code}")
+                # Poll status
+                response = requests.get(query_url, headers=headers, timeout=30)
                 
                 if response.status_code != 200:
-                    error_text = response.text
                     print(f"ERROR: Poll failed with status {response.status_code}")
-                    print(f"ERROR: Response: {error_text}")
-                    # For 400 errors, log the full details
-                    if response.status_code == 400:
+                    # Retry on server errors, abort on client errors
+                    if response.status_code >= 500:
+                        await asyncio.sleep(5)
+                        continue
+                    return None
+
+                data = response.json()
+                output = data.get("output", {})
+                task_status = output.get("task_status")
+
+                if task_status == "SUCCEEDED":
+                    video_url = output.get("video_url")
+                    print(f"DEBUG: Task {task_id} SUCCEEDED. Video URL: {video_url}")
+                    
+                    # --- FIX: DOWNLOAD THE VIDEO ---
+                    if video_url:
                         try:
-                            error_json = response.json()
-                            print(f"ERROR: Error details: {json.dumps(error_json, indent=2)}")
-                        except:
-                            pass
-                    raise Exception(f"Failed to check task status: {response.status_code} - {error_text}")
+                            print(f"Downloading video from: {video_url}")
+                            video_resp = requests.get(video_url, timeout=300)
+                            if video_resp.status_code == 200:
+                                # Save to clips directory
+                                filename = f"{clip_id}.mp4"
+                                clip_path = os.path.join(self.clips_dir, filename)
+                                
+                                with open(clip_path, 'wb') as f:
+                                    f.write(video_resp.content)
+                                
+                                print(f"Video saved to: {clip_path}")
+                                return clip_path  # Return local path, not URL
+                            else:
+                                print(f"ERROR: Failed to download video: {video_resp.status_code}")
+                                return None
+                        except Exception as dl_err:
+                            print(f"ERROR: Exception downloading video: {dl_err}")
+                            return None
+                    return None
                 
-                result = response.json()
-                
-                # Check for errors
-                if result.get("code") and result.get("code") != "Success":
-                    raise Exception(f"Status check error: {result.get('message', result.get('code', 'Unknown error'))}")
-                
-                output = result.get("output", {})
-                # Alibaba API might return status in different fields
-                status = output.get("task_status") or output.get("status") or result.get("status")
-                
-                if not status:
-                    # Debug: print the full response to understand structure
-                    print(f"DEBUG: Full response structure: {json.dumps(result, indent=2)[:500]}")
-                    status = "UNKNOWN"
-                
-                print(f"Task {task_id} status: {status} (attempt {attempt + 1}/{max_attempts})")
-                
-                if status in ["SUCCEEDED", "succeeded", "SUCCESS", "success", "COMPLETED", "completed"]:
-                    # Get video URL - check multiple possible fields
-                    video_url = (
-                        output.get("video_url") or 
-                        output.get("video") or 
-                        output.get("url") or
-                        result.get("video_url")
-                    )
-                    
-                    if not video_url:
-                        print(f"DEBUG: Output structure: {json.dumps(output, indent=2)[:500]}")
-                        raise Exception(f"No video URL in output. Full output: {output}")
-                    
-                    # Download video
-                    print(f"Downloading video from: {video_url}")
-                    video_response = requests.get(video_url, timeout=300)
-                    if video_response.status_code != 200:
-                        raise Exception(f"Failed to download video: {video_response.status_code}")
-                    
-                    # Save video file
-                    clip_path = os.path.join(self.clips_dir, f"{clip_id}.mp4")
-                    with open(clip_path, 'wb') as f:
-                        f.write(video_response.content)
-                    
-                    print(f"Video saved to: {clip_path}")
-                    return clip_path
-                
-                elif status in ["FAILED", "failed", "ERROR", "error"]:
-                    error_msg = output.get("message") or output.get("error") or "Unknown error"
-                    raise Exception(f"Task failed: {error_msg}")
-                
-                # Task still processing (PENDING, RUNNING, etc.), wait and retry
-                await asyncio.sleep(5)  # Wait 5 seconds before next poll
-                attempt += 1
+                elif task_status == "FAILED":
+                    print(f"ERROR: Task {task_id} FAILED")
+                    print(f"ERROR: Details: {data}")
+                    return None
                 
             except Exception as e:
-                if attempt >= max_attempts - 1:
-                    raise Exception(f"Task polling failed after {max_attempts} attempts: {e}")
-                await asyncio.sleep(5)
-                attempt += 1
-        
-        raise Exception(f"Task {task_id} did not complete within timeout period")
+                print(f"ERROR: Exception during polling: {e}")
+
+            # Wait before next poll
+            await asyncio.sleep(5)
+
+        print(f"ERROR: Polling timed out for task {task_id}")
+        return None
     
     def _create_placeholder_video(self, clip_id: str) -> str:
         """Create a placeholder video using FFmpeg (for testing)"""
