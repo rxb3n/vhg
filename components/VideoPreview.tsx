@@ -1,26 +1,70 @@
 'use client'
 
 import { AdGeneration } from '@/types'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 
 interface VideoPreviewProps {
   adGeneration: AdGeneration
 }
 
 export default function VideoPreview({ adGeneration }: VideoPreviewProps) {
-  const [selectedClip, setSelectedClip] = useState<number | null>(null)
+  const [progress, setProgress] = useState(0)
+
+  // Calculate progress based on clips
+  useEffect(() => {
+    if (adGeneration.status === 'completed') {
+      setProgress(100)
+    } else if (adGeneration.clips && adGeneration.clips.length > 0) {
+      const completedCount = adGeneration.clips.filter((c: any) => c.status === 'completed').length
+      const totalClips = adGeneration.clips.length || 12 // Default to 12 if not set
+      const calculatedProgress = Math.round((completedCount / totalClips) * 100)
+      setProgress(calculatedProgress)
+    } else {
+      setProgress(5) // Start at 5% if processing but no clips yet
+    }
+  }, [adGeneration])
 
   return (
     <div className="bg-white rounded-lg shadow-lg p-8">
-      <h2 className="text-2xl font-semibold mb-6 text-gray-800">Video Preview</h2>
+      <h2 className="text-2xl font-semibold mb-6 text-gray-800">Video Generation</h2>
       
+      {/* Progress Section */}
+      {adGeneration.status !== 'completed' && adGeneration.status !== 'failed' && (
+        <div className="mb-8">
+          <div className="flex justify-between text-sm text-gray-600 mb-2">
+            <span>Generating Scenes...</span>
+            <span>{progress}%</span>
+          </div>
+          <div className="w-full bg-gray-200 rounded-full h-4 overflow-hidden">
+             <div 
+               className="bg-indigo-600 h-full transition-all duration-500 ease-out"
+               style={{ width: `${progress}%` }}
+             ></div>
+          </div>
+          <div className="mt-4 grid grid-cols-4 gap-2">
+            {adGeneration.clips?.map((clip: any, idx: number) => (
+               <div key={idx} className={`h-1.5 rounded-full ${
+                 clip.status === 'completed' ? 'bg-green-500' : 
+                 clip.status === 'generating' ? 'bg-indigo-400 animate-pulse' : 'bg-gray-200'
+               }`} />
+            ))}
+          </div>
+          <p className="text-center text-sm text-gray-500 mt-4">
+            This may take 3-5 minutes. Please don't close this tab.
+          </p>
+        </div>
+      )}
+
+      {/* Video Player */}
       {adGeneration.final_video_url ? (
         <div className="space-y-6">
-          <div className="bg-black rounded-lg overflow-hidden" style={{ aspectRatio: '9/16', maxWidth: '405px', margin: '0 auto' }}>
+          <div className="bg-black rounded-lg overflow-hidden border-4 border-gray-900 shadow-2xl" style={{ aspectRatio: '9/16', maxWidth: '360px', margin: '0 auto' }}>
             <video
               src={`http://localhost:8000${adGeneration.final_video_url}`}
               controls
-              className="w-full h-full"
+              autoPlay
+              loop
+              className="w-full h-full object-cover"
             >
               Your browser does not support the video tag.
             </video>
@@ -30,52 +74,17 @@ export default function VideoPreview({ adGeneration }: VideoPreviewProps) {
             <a
               href={`http://localhost:8000${adGeneration.final_video_url}`}
               download
-              className="inline-block px-6 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors"
+              className="inline-flex items-center px-6 py-3 border border-transparent text-base font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700"
             >
               Download Video
             </a>
           </div>
         </div>
-      ) : (
-        <div className="text-center py-12">
-          <div className="animate-spin rounded-full h-16 w-16 border-b-2 border-indigo-600 mx-auto mb-4"></div>
-          <p className="text-xl text-gray-700">Assembling final video...</p>
+      ) : adGeneration.status === 'failed' ? (
+        <div className="text-center text-red-600 p-4 bg-red-50 rounded-lg">
+          <p>Generation failed. Please try again.</p>
         </div>
-      )}
-
-      {adGeneration.clips && adGeneration.clips.length > 0 && (
-        <div className="mt-8">
-          <h3 className="text-lg font-semibold mb-4 text-gray-800">Individual Clips</h3>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            {adGeneration.clips.map((clip) => (
-              <div
-                key={clip.id}
-                className={`border-2 rounded-lg overflow-hidden cursor-pointer transition-all ${
-                  selectedClip === clip.sequence_index
-                    ? 'border-indigo-600 ring-2 ring-indigo-300'
-                    : 'border-gray-200 hover:border-indigo-400'
-                }`}
-                onClick={() => setSelectedClip(clip.sequence_index)}
-                style={{ aspectRatio: '9/16' }}
-              >
-                {clip.local_path || clip.s3_url ? (
-                  <video
-                    src={clip.local_path ? `http://localhost:8000/api/files/${clip.local_path.split('/').pop()}` : clip.s3_url}
-                    className="w-full h-full object-cover"
-                    muted
-                    playsInline
-                  />
-                ) : (
-                  <div className="w-full h-full bg-gray-100 flex items-center justify-center">
-                    <span className="text-gray-400 text-sm">Clip {clip.sequence_index}</span>
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      ) : null}
     </div>
   )
 }
-

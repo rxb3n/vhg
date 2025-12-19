@@ -72,100 +72,26 @@ class VisionDirector:
         """Generate hash of image for caching"""
         with open(image_path, 'rb') as f:
             return hashlib.md5(f.read()).hexdigest()
-    
-    async def _analyze_with_openai(self, image_data: bytes) -> Dict[str, Any]:
-        """Analyze using GPT-4o"""
-        import base64
-        
-        base64_image = base64.b64encode(image_data).decode('utf-8')
-        
-        system_prompt = """You are an expert TV Commercial Director. You will receive an image of a product. Your task is to write a script for a 60-second viral video, broken down into exactly 12 scenes of 5 seconds each.
 
-Rules:
-1. Analyze First: Extract a physical description of the product (color, material, label text) and insert this description into EVERY scene prompt to help the video AI.
-2. Visual Continuity: Ensure scenes flow logically (e.g., establishing shot -> close up -> usage -> lifestyle).
-3. Prompt Structure: Use the format: 'Cinematic shot, [Visual Description], [Action/Movement], [Lighting/Environment]'.
-4. Each scene should include: id, action, prompt, role (hook/problem/solution/proof/CTA), shot_type, continuity_constraints.
-5. Output: Return ONLY valid JSON."""
-
-        user_prompt = """Analyze this product image and generate a 12-scene script. Return a JSON object with:
-{
-  "product_name": "string",
-  "master_description": "detailed visual description",
-  "scenes": [
-    {
-      "id": 1,
-      "action": "string",
-      "prompt": "string",
-      "role": "hook|problem|solution|proof|CTA",
-      "shot_type": "string",
-      "continuity_constraints": "string"
-    }
-  ]
-}"""
-
-        response = self.openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            max_tokens=2000,
-            temperature=0.7
-        )
-        
-        content = response.choices[0].message.content
-        
-        # Extract JSON from response
-        try:
-            # Try to parse as-is
-            script = json.loads(content)
-        except:
-            # Try to extract JSON from markdown code blocks
-            import re
-            json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
-            if json_match:
-                script = json.loads(json_match.group(1))
-            else:
-                json_match = re.search(r'```\s*(.*?)\s*```', content, re.DOTALL)
-                if json_match:
-                    script = json.loads(json_match.group(1))
-                else:
-                    raise Exception("Could not parse JSON from response")
-        
-        # Validate structure
-        if "scenes" not in script or len(script["scenes"]) != 12:
-            raise Exception("Script must contain exactly 12 scenes")
-        
-        return script
-    
     async def _analyze_with_gemini(self, image_path: str) -> Dict[str, Any]:
-        """Analyze using Gemini 2.5 Flash"""
-        from PIL import Image
+        """Analyze using Gemini 1.5/2.5 Flash"""
+        import PIL.Image
         
-        if not self.gemini_client:
-            raise Exception("Gemini client not initialized. Check GEMINI_API_KEY in .env file.")
+        img = PIL.Image.open(image_path)
         
-        image = Image.open(image_path)
-        
-        system_prompt = """You are an expert TV Commercial Director. Analyze the product image and generate a script for a 60-second viral video, broken down into exactly 12 scenes of 5 seconds each.
+        system_prompt = """You are an expert TikTok Content Strategist. 
+Analyze the product image and generate a script for a viral, authentic UGC (User Generated Content) video.
+The video must be exactly 60 seconds, broken down into 12 scenes of 5 seconds each.
+
+STRICT VISUAL STYLE GUIDE:
+All scenes MUST follow this exact visual formula to ensure consistency:
+"Vertical 9:16 video of a [person matching target audience] in a [bright, aesthetic setting like a bathroom/kitchen/living room] holding the [Product Name] close to the camera, talking directly to the viewer like a TikTok creator. They say '[Short Line matching the scene role]', while [action like applying/showing texture/pointing] and smiling at the camera. Soft natural daylight, clean white and pastel background, subtle text on screen: '[Key Benefit/Hook]'. Handheld phone style, authentic UGC testimonial vibe, smooth 5-second clip, high-definition, readable label on the product."
 
 Rules:
-1. Extract a physical description of the product (color, material, label text) and insert this description into EVERY scene prompt.
-2. Ensure scenes flow logically (establishing shot -> close up -> usage -> lifestyle).
-3. Use format: 'Cinematic shot, [Visual Description], [Action/Movement], [Lighting/Environment]'.
-4. Each scene should include: id, action, prompt, role (hook/problem/solution/proof/CTA), shot_type, continuity_constraints.
+1. Extract the exact product name, type, and physical details (color, material) from the image.
+2. Structure the 12 scenes to tell a story: Hook (1-3) -> Problem (4-6) -> Solution/Demo (7-9) -> Social Proof/CTA (10-12).
+3. Ensure strict visual continuity: same actor, same setting, same lighting in every prompt.
+4. The 'prompt' field in the JSON must be the full, detailed generation prompt following the style guide above.
 5. Return ONLY valid JSON."""
 
         prompt = f"""{system_prompt}
@@ -173,28 +99,21 @@ Rules:
 Return a JSON object with:
 {{
   "product_name": "string",
-  "master_description": "detailed visual description",
+  "master_description": "detailed visual description of product and consistent actor/setting",
   "scenes": [
     {{
       "id": 1,
-      "action": "string",
-      "prompt": "string",
+      "action": "short description of action",
+      "prompt": "Vertical 9:16 video of a young woman in a bright bathroom holding a...",
       "role": "hook|problem|solution|proof|CTA",
-      "shot_type": "string",
-      "continuity_constraints": "string"
+      "shot_type": "medium close-up",
+      "continuity_constraints": "same actor, bright bathroom setting"
     }}
   ]
 }}"""
 
         try:
-            print(f"Calling Gemini API with image: {image_path}")
-            print(f"Image format: {image.format}, size: {image.size}")
-            
-            # Generate content with error handling
-            response = self.gemini_client.generate_content([prompt, image])
-            
-            if not response:
-                raise Exception("Gemini API returned empty response")
+            response = self.gemini_client.generate_content([prompt, img])
             
             # Handle different response formats
             content = None
@@ -213,47 +132,61 @@ Return a JSON object with:
                     content = str(response)
                 except:
                     pass
-                
-                if not content:
-                    raise Exception(f"Gemini API response has no text. Response type: {type(response)}, attributes: {dir(response)}")
-            
-            print(f"Gemini response received, length: {len(content)}")
-            print(f"First 200 chars: {content[:200]}")
-            
-        except Exception as e:
-            error_msg = f"Gemini API error: {str(e)}"
-            print(f"ERROR: {error_msg}")
-            import traceback
-            print(traceback.format_exc())
-            raise Exception(error_msg)
-        
-        # Extract JSON
-        import re
-        try:
-            json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
-            if json_match:
-                script = json.loads(json_match.group(1))
-            else:
-                json_match = re.search(r'```\s*(.*?)\s*```', content, re.DOTALL)
-                if json_match:
-                    script = json.loads(json_match.group(1))
-                else:
-                    # Try to find JSON object directly
-                    json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                    if json_match:
-                        script = json.loads(json_match.group(0))
-                    else:
-                        script = json.loads(content)
-        except json.JSONDecodeError as e:
-            error_msg = f"Failed to parse JSON from Gemini response. Error: {str(e)}\nResponse content: {content[:500]}"
-            print(f"ERROR: {error_msg}")
-            raise Exception(error_msg)
-        
-        if "scenes" not in script:
-            raise Exception(f"Script missing 'scenes' key. Got keys: {list(script.keys())}")
-        
-        if len(script["scenes"]) != 12:
-            raise Exception(f"Script must contain exactly 12 scenes, got {len(script['scenes'])}")
-        
-        return script
+                    
+            if not content:
+                raise Exception(f"Gemini API response has no text.")
 
+            # Clean up markdown
+            content = content.replace('```json', '').replace('```', '').strip()
+            
+            try:
+                script = json.loads(content)
+                # Enforce tone
+                script['tone'] = 'UGC'
+                return script
+            except json.JSONDecodeError:
+                # Fallback extraction
+                start_idx = content.find('{')
+                end_idx = content.rfind('}') + 1
+                if start_idx != -1 and end_idx != -1:
+                    json_str = content[start_idx:end_idx]
+                    script = json.loads(json_str)
+                    script['tone'] = 'UGC'
+                    return script
+                raise
+                
+        except Exception as e:
+            print(f"Error calling Gemini: {e}")
+            raise
+
+    async def _analyze_with_openai(self, image_data: bytes) -> Dict[str, Any]:
+        """Analyze using GPT-4o (Fallback)"""
+        import base64
+        base64_image = base64.b64encode(image_data).decode('utf-8')
+        
+        system_prompt = """You are an expert TikTok Content Strategist. 
+Analyze the product image and generate a script for a viral, authentic UGC (User Generated Content) video.
+The video must be exactly 60 seconds, broken down into 12 scenes of 5 seconds each.
+
+STRICT VISUAL STYLE GUIDE:
+All scenes MUST follow this exact visual formula to ensure consistency:
+"Vertical 9:16 video of a [person matching target audience] in a [bright, aesthetic setting like a bathroom/kitchen/living room] holding the [Product Name] close to the camera, talking directly to the viewer like a TikTok creator. They say '[Short Line matching the scene role]', while [action like applying/showing texture/pointing] and smiling at the camera. Soft natural daylight, clean white and pastel background, subtle text on screen: '[Key Benefit/Hook]'. Handheld phone style, authentic UGC testimonial vibe, smooth 5-second clip, high-definition, readable label on the product."
+"""
+        # ... (rest of OpenAI logic similar to Gemini, ensuring strict JSON output)
+        
+        response = self.openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Generate the 12-scene JSON script."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                ]}
+            ],
+            response_format={"type": "json_object"}
+        )
+        
+        content = response.choices[0].message.content
+        script = json.loads(content)
+        script['tone'] = 'UGC'
+        return script

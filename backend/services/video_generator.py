@@ -2,10 +2,15 @@ import os
 import uuid
 import asyncio
 import requests
+import shutil
+import base64
+import subprocess
 from typing import Dict, Any, List
 from database import get_db, get_db_session
 from models import AdGeneration, Clip
 import json
+from PIL import Image
+import io
 
 class VideoGenerator:
     def __init__(self):
@@ -39,14 +44,12 @@ class VideoGenerator:
             # Get master description and shared context
             master_description = script.get("master_description", "")
             product_name = script.get("product_name", "product")
-            tone = script.get("tone", "UGC")
             
-            # Build shared context
-            shared_context = self._build_shared_context(product_name, master_description, tone)
+            # FORCE UGC TONE (ignoring script input)
+            shared_context = self._build_shared_context(product_name, master_description)
             
             # Load original product image - handle both full URLs and relative paths
             # Normalize the image URL to extract the filename
-            import re
             
             # Remove protocol and domain if present
             normalized_url = image_url
@@ -87,10 +90,7 @@ class VideoGenerator:
             if not scenes:
                 raise Exception("Script has no scenes")
             
-            # DEBUG: Only create 1 clip record for faster debugging
-            print(f"DEBUG MODE: Only creating 1 clip record (out of {len(scenes)} scenes)")
-            scenes = scenes[:1]  # Only use first scene
-            
+            # --- FULL PRODUCTION MODE: Process ALL scenes ---
             clips = []
             for scene in scenes:
                 # Handle both dict and Pydantic model scenes
@@ -111,7 +111,7 @@ class VideoGenerator:
             db.commit()
             print(f"DEBUG: Created {len(clips)} clip record(s) in database")
             
-            # Generate clips in parallel (limit concurrency)
+            # Generate clips in parallel (limit concurrency to avoid rate limits)
             semaphore = asyncio.Semaphore(3)  # Max 3 concurrent generations
             
             # Ensure all scenes are dicts
@@ -121,11 +121,10 @@ class VideoGenerator:
                     scene = scene.dict() if hasattr(scene, 'dict') else scene
                 scenes_dicts.append(scene)
             
-            # DEBUG: Only generate first clip for faster debugging
-            print("DEBUG MODE: Only generating first clip")
+            print(f"Starting generation for all {len(clips)} clips...")
             tasks = [
                 self._generate_clip_with_semaphore(semaphore, clip, image_path, shared_context, scene)
-                for clip, scene in zip(clips[:1], scenes_dicts[:1])  # Only first clip
+                for clip, scene in zip(clips, scenes_dicts)
             ]
             
             await asyncio.gather(*tasks)
@@ -137,37 +136,22 @@ class VideoGenerator:
                 Clip.status == "completed"
             ).count()
             
-            # DEBUG: For now, mark as completed if at least 1 clip is done
-            if completed_clips >= 1:
-                # DEBUG: Skip assembly for now, just mark as completed
-                print(f"DEBUG: {completed_clips} clip(s) completed. Marking as completed (skipping assembly).")
-                ad_gen.status = "completed"
-                # Set a dummy final video URL for the first clip
-                if completed_clips > 0:
-                    first_clip = db.query(Clip).filter(
-                        Clip.ad_id == ad_id,
-                        Clip.status == "completed"
-                    ).order_by(Clip.sequence_index).first()
-                    if first_clip and first_clip.local_path:
-                        # Use the first clip as the final video for debugging
-                        final_filename = f"{ad_id}_final.mp4"
-                        output_dir = "output"
-                        os.makedirs(output_dir, exist_ok=True)
-                        final_path = os.path.join(output_dir, final_filename)
-                        shutil.copy(first_clip.local_path, final_path)
-                        ad_gen.final_video_url = f"/api/videos/{final_filename}"
+            if completed_clips == len(scenes):
+                print(f"DEBUG: All {completed_clips} clips completed. Starting assembly.")
+                
+                # Update status to "assembling"
+                ad_gen.status = "assembling"
                 db.commit()
                 
-                # Uncomment below to enable full assembly
-                # # Update status to "assembling"
-                # ad_gen.status = "assembling"
-                # db.commit()
-                # # Start assembly
-                # from services.video_assembler import VideoAssembler
-                # assembler = VideoAssembler()
-                # await assembler.assemble_video(ad_id)
+                # Start assembly
+                from services.video_assembler import VideoAssembler
+                assembler = VideoAssembler()
+                await assembler.assemble_video(ad_id)
+                
             else:
-                print(f"ERROR: Only {completed_clips}/1 clips completed. Marking as failed.")
+                print(f"ERROR: Only {completed_clips}/{len(scenes)} clips completed. Marking as failed.")
+                # If we have some clips, we might want to let the user see them, 
+                # but technically the full generation failed.
                 ad_gen.status = "failed"
                 db.commit()
                 
@@ -200,29 +184,34 @@ class VideoGenerator:
             print(f"DEBUG: Starting generation for clip {clip_id} (sequence {clip.sequence_index})")
             clip.status = "generating"
             db.commit()
-            print(f"DEBUG: Updated clip {clip_id} status to 'generating'")
             
             # Ensure scene is a dict
             if not isinstance(scene, dict):
                 scene = scene.dict() if hasattr(scene, 'dict') else scene
             
             # Build full prompt with shared context
+            # We append the specific scene prompt to the shared context
             full_prompt = f"{shared_context}\n\nShot {clip.sequence_index} of 12: {scene.get('prompt', '')}"
             
             # Call Wan 2.6 API
+            # This returns the LOCAL path (clips/filename.mp4)
             clip_path = await self._call_wan_api(
                 prompt=full_prompt,
                 image_path=image_path,
                 clip_id=clip.id
             )
             
+            # Ensure we store the relative path with forward slashes for the frontend
+            # The _call_wan_api returns the full relative path e.g., "clips/abcd.mp4"
+            filename = os.path.basename(clip_path)
+            web_friendly_path = f"clips/{filename}"
+            
             # Update clip record
-            print(f"DEBUG: Clip {clip_id} generation successful. Updating database...")
-            clip.local_path = clip_path
+            print(f"DEBUG: Clip {clip_id} generation successful. Path: {web_friendly_path}")
+            clip.local_path = web_friendly_path
             clip.status = "completed"
             clip.duration = 5.0
             db.commit()
-            print(f"DEBUG: Clip {clip_id} marked as completed in database")
             
         except Exception as e:
             error_msg = str(e)
@@ -231,9 +220,8 @@ class VideoGenerator:
                 # Refresh clip again in case session expired
                 clip = db.query(Clip).filter(Clip.id == clip_id).first()
                 if clip:
-                    # If placeholder was created, mark as completed
+                    # If placeholder was created (in dev mode without key), mark as completed
                     if 'placeholder' in error_msg.lower() or 'WARNING' in error_msg:
-                        # Placeholder video was created, mark as completed
                         if clip.local_path and os.path.exists(clip.local_path):
                             clip.status = "completed"
                             clip.duration = 5.0
@@ -242,9 +230,11 @@ class VideoGenerator:
                             clip.status = "failed"
                     else:
                         clip.status = "failed"
-                    db.commit()
+                
+                db.commit()
             except Exception as db_error:
                 print(f"Error updating clip status: {db_error}")
+            
             if 'placeholder' not in error_msg.lower() and 'WARNING' not in error_msg:
                 raise
         finally:
@@ -252,176 +242,82 @@ class VideoGenerator:
     
     async def _call_wan_api(self, prompt: str, image_path: str, clip_id: str) -> str:
         """Call Wan 2.6 API for image-to-video generation"""
-        
         print(f"DEBUG: _call_wan_api called for clip {clip_id}")
-        print(f"DEBUG: Image path: {image_path}, exists: {os.path.exists(image_path) if image_path else False}")
         
         # If no API key, create a placeholder video file
         if not self.wan_api_key:
             print("WARNING: WAN_API_KEY not set. Creating placeholder video.")
             return self._create_placeholder_video(clip_id)
         
-        print(f"DEBUG: Starting Wan API call for clip {clip_id}")
         try:
-            # Read and encode image to base64
-            import base64
+            # Read and encode image to base64 for API transmission
             with open(image_path, 'rb') as f:
                 image_data = f.read()
                 image_base64 = base64.b64encode(image_data).decode('utf-8')
             
-            # Determine image MIME type
-            from PIL import Image
-            img = Image.open(image_path)
-            mime_type = f"image/{img.format.lower()}" if img.format else "image/jpeg"
-            
-            # Prepare request body for Alibaba Model Studio Wan 2.6 I2V
-            # Alibaba DashScope API format - using img_url parameter
-            # Model name can be overridden via WAN_MODEL_NAME env var
-            # Common model names: wan2.6-i2v, wan2.6-video, wan-i2v-2.6, etc.
-            model_name = os.getenv("WAN_MODEL_NAME", "wan2.6-i2v")
-            
-            payload = {
-                "model": model_name,
-                "input": {
-                    "img_url": f"data:{mime_type};base64,{image_base64}",
-                    "prompt": prompt
-                },
-                "parameters": {
-                    "aspect_ratio": "9:16",
-                    "duration": 5,
-                    "resolution": "720P"
-                }
-            }
-            
-            print(f"Using model: {model_name}")
-            
+            # Determine correct headers based on API docs
             headers = {
                 "Authorization": f"Bearer {self.wan_api_key}",
                 "Content-Type": "application/json",
-                "X-DashScope-Async": "enable"  # Required for async processing
+                "X-DashScope-Async": "enable"  # Required for async tasks
             }
             
-            print(f"Submitting Wan 2.6 I2V task to: {self.wan_api_url}")
-            print(f"Using API key: {self.wan_api_key[:10]}...{self.wan_api_key[-5:] if len(self.wan_api_key) > 15 else '***'}")
+            # Payload for Wan 2.6 Image-to-Video
+            payload = {
+                "model": "wan2.1-i2v-plus", # Using the stable endpoint model
+                "input": {
+                    "prompt": prompt,
+                    "image": f"data:image/jpeg;base64,{image_base64}"
+                },
+                "parameters": {
+                    "size": "720*1280", # 9:16 vertical
+                    "duration": 5,
+                    "n": 1
+                }
+            }
             
-            # Submit task (Alibaba API is async)
-            response = requests.post(
-                self.wan_api_url,
-                json=payload,
-                headers=headers,
-                timeout=30
-            )
-            
-            if response.status_code == 401:
-                error_text = response.text
-                print(f"ERROR: Authentication failed (401)")
-                print(f"Response: {error_text}")
-                print("\nTroubleshooting:")
-                print("1. Verify your WAN_API_KEY in .env file is correct")
-                print("2. Check that the API key is from Alibaba Model Studio (DashScope)")
-                print("3. Ensure the WAN_API_URL is set correctly in .env")
-                print(f"   Current URL: {self.wan_api_url}")
-                print("   Expected format: https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/generation")
-                raise Exception(f"Wan API authentication failed: {error_text}")
+            # Submit Task
+            print(f"DEBUG: Submitting task for clip {clip_id} to {self.wan_api_url}")
+            response = requests.post(self.wan_api_url, headers=headers, json=payload, timeout=30)
             
             if response.status_code != 200:
-                error_text = response.text
-                raise Exception(f"Wan API submission error: {response.status_code} - {error_text}")
-            
-            result = response.json()
-            
-            # Check for Alibaba API error format
-            if result.get("code") and result.get("code") != "Success":
-                error_code = result.get("code")
-                error_msg = result.get("message", result.get("code", "Unknown error"))
-                print(f"API Error Code: {error_code}")
-                print(f"Error Message: {error_msg}")
+                print(f"ERROR: API Submission failed: {response.status_code} - {response.text}")
+                raise Exception(f"API Submission failed: {response.text}")
                 
-                # If model doesn't exist, provide helpful message
-                if error_code == "InvalidParameter" and ("Model not exist" in error_msg or "model" in error_msg.lower()):
-                    print("\n" + "="*60)
-                    print("TROUBLESHOOTING: Model Not Found")
-                    print("="*60)
-                    print(f"Current model name: {model_name}")
-                    print("\nTo fix this:")
-                    print("1. Check the Alibaba Model Studio API documentation")
-                    print("2. Find the correct model name for Wan 2.6 image-to-video")
-                    print("3. Set WAN_MODEL_NAME in your .env file with the correct model name")
-                    print("\nCommon model name formats to try:")
-                    print("  - wan2.6-i2v")
-                    print("  - wan2.6-video")
-                    print("  - wan-i2v-2.6")
-                    print("  - wan2.6-i2v-plus")
-                    print("  - wan-video-2.6")
-                    print("="*60)
+            task_data = response.json()
+            # Check for output.task_id (standard DashScope response)
+            if 'output' in task_data and 'task_id' in task_data['output']:
+                task_id = task_data['output']['task_id']
+            # Sometimes it might be at root depending on specific endpoint version
+            elif 'task_id' in task_data:
+                task_id = task_data['task_id']
+            else:
+                raise Exception(f"No task_id in response: {task_data}")
                 
-                raise Exception(f"Wan API error: {error_msg}")
-            
-            # Alibaba returns task_id in output.task_id or request_id
-            # For async requests, task_id is in output.task_id
-            output = result.get("output", {})
-            task_id = output.get("task_id") or result.get("request_id") or result.get("task_id")
-            
-            # Also check if it's in the response directly
-            if not task_id:
-                task_id = result.get("task_id")
-            
-            if not task_id:
-                # If synchronous response with video URL
-                video_url = output.get("video_url")
-                if video_url:
-                    # Download directly
-                    print(f"Video ready immediately. Downloading from: {video_url}")
-                    video_response = requests.get(video_url, timeout=300)
-                    if video_response.status_code != 200:
-                        raise Exception(f"Failed to download video: {video_response.status_code}")
-                    
-                    clip_path = os.path.join(self.clips_dir, f"{clip_id}.mp4")
-                    with open(clip_path, 'wb') as f:
-                        f.write(video_response.content)
-                    return clip_path
-                else:
-                    raise Exception(f"No task_id or video_url in response: {result}")
-            
             print(f"DEBUG: Task submitted successfully. Task ID: {task_id}")
             
-            # Poll for completion
-            print(f"DEBUG: Starting to poll for task {task_id}")
+            # Poll for completion and download
             clip_path = await self._poll_wan_task(task_id, clip_id)
-            print(f"DEBUG: Polling completed. Clip path: {clip_path}")
-            return clip_path
+            
+            if not clip_path:
+                raise Exception("Polling failed or timed out")
                 
-        except requests.exceptions.ConnectionError as e:
-            error_msg = str(e)
-            if 'getaddrinfo failed' in error_msg or 'Failed to resolve' in error_msg:
-                print(f"WARNING: Cannot connect to Wan API at {self.wan_api_url}")
-                print("This might mean:")
-                print("  1. The API endpoint URL is incorrect")
-                print("  2. The service is temporarily unavailable")
-                print("  3. There's a network/DNS issue")
-                print("Falling back to placeholder video...")
-                return self._create_placeholder_video(clip_id)
-            else:
-                raise
-        except requests.exceptions.Timeout:
-            print(f"WARNING: Wan API request timed out. Creating placeholder video...")
-            return self._create_placeholder_video(clip_id)
+            return clip_path
+
         except Exception as e:
-            error_msg = str(e)
-            if 'getaddrinfo failed' in error_msg or 'Failed to resolve' in error_msg:
-                print(f"WARNING: Cannot resolve Wan API hostname. Creating placeholder video...")
-                return self._create_placeholder_video(clip_id)
-            else:
-                print(f"WARNING: Wan API error: {e}. Creating placeholder video...")
-                return self._create_placeholder_video(clip_id)
-    
+            print(f"Exception in _call_wan_api: {e}")
+            # Fallback for dev/demo if API fails
+            # return self._create_placeholder_video(clip_id) 
+            raise e
+
     async def _poll_wan_task(self, task_id, clip_id):
         """
         Polls the Wan API for task status and downloads result on success.
         """
         print(f"DEBUG: _poll_wan_task started for task {task_id}, clip {clip_id}")
         
-        # Determine base host for polling
+        # Determine base host for polling (remove specific path)
+        # DashScope standard polling is GET /api/v1/tasks/{task_id}
         if "dashscope-intl" in self.wan_api_url:
             base_host = "https://dashscope-intl.aliyuncs.com"
         else:
@@ -437,12 +333,11 @@ class VideoGenerator:
         print("DEBUG: Will poll up to 120 times (5 seconds between attempts)")
         for i in range(120):
             try:
-                # Poll status
+                # Poll status using GET
                 response = requests.get(query_url, headers=headers, timeout=30)
                 
                 if response.status_code != 200:
                     print(f"ERROR: Poll failed with status {response.status_code}")
-                    # Retry on server errors, abort on client errors
                     if response.status_code >= 500:
                         await asyncio.sleep(5)
                         continue
@@ -454,35 +349,39 @@ class VideoGenerator:
 
                 if task_status == "SUCCEEDED":
                     video_url = output.get("video_url")
-                    print(f"DEBUG: Task {task_id} SUCCEEDED. Video URL: {video_url}")
+                    print(f"DEBUG: Task {task_id} SUCCEEDED. Remote URL: {video_url}")
                     
-                    # --- FIX: DOWNLOAD THE VIDEO ---
                     if video_url:
+                        # --- DOWNLOAD LOGIC ---
                         try:
-                            print(f"Downloading video from: {video_url}")
+                            print(f"Downloading video for clip {clip_id}...")
                             video_resp = requests.get(video_url, timeout=300)
+                            
                             if video_resp.status_code == 200:
-                                # Save to clips directory
                                 filename = f"{clip_id}.mp4"
                                 clip_path = os.path.join(self.clips_dir, filename)
                                 
                                 with open(clip_path, 'wb') as f:
                                     f.write(video_resp.content)
                                 
-                                print(f"Video saved to: {clip_path}")
-                                return clip_path  # Return local path, not URL
+                                print(f"Video saved locally to: {clip_path}")
+                                return clip_path  # Return local file system path
                             else:
                                 print(f"ERROR: Failed to download video: {video_resp.status_code}")
                                 return None
                         except Exception as dl_err:
                             print(f"ERROR: Exception downloading video: {dl_err}")
                             return None
-                    return None
+                    else:
+                        print("ERROR: Task succeeded but no video_url found")
+                        return None
                 
                 elif task_status == "FAILED":
                     print(f"ERROR: Task {task_id} FAILED")
                     print(f"ERROR: Details: {data}")
                     return None
+                
+                # If PENDING or RUNNING, just continue loop
                 
             except Exception as e:
                 print(f"ERROR: Exception during polling: {e}")
@@ -494,16 +393,28 @@ class VideoGenerator:
         return None
     
     def _create_placeholder_video(self, clip_id: str) -> str:
-        """Create a placeholder video using FFmpeg (for testing)"""
-        import subprocess
+        """Create a placeholder video using FFmpeg if API is unavailable"""
+        filename = f"{clip_id}.mp4"
+        clip_path = os.path.join(self.clips_dir, filename)
         
-        clip_path = os.path.join(self.clips_dir, f"{clip_id}.mp4")
+        if os.path.exists(clip_path):
+            return clip_path
+            
+        print(f"Creating placeholder video for {clip_id}...")
         
+        # Check if ffmpeg is available
+        if shutil.which('ffmpeg') is None:
+            print("ERROR: ffmpeg not found. Cannot create placeholder video.")
+            # Create a dummy empty file just to avoid crashes, though it won't play
+            with open(clip_path, 'wb') as f:
+                f.write(b'placeholder')
+            return clip_path
+
         # Create a 5-second black video with text
         cmd = [
             'ffmpeg',
             '-f', 'lavfi',
-            '-i', 'color=c=black:s=405x720:d=5',
+            '-i', 'color=c=black:s=405x720:d=5', # 9:16 aspect ratio approximation
             '-vf', f'drawtext=text=Clip\\ {clip_id[:8]}:fontcolor=white:fontsize=30:x=(w-text_w)/2:y=(h-text_h)/2',
             '-c:v', 'libx264',
             '-preset', 'fast',
@@ -516,21 +427,19 @@ class VideoGenerator:
         try:
             subprocess.run(cmd, check=True, capture_output=True)
             return clip_path
-        except:
-            # If FFmpeg fails, just return the path anyway
+        except Exception as e:
+            print(f"Error creating placeholder with ffmpeg: {e}")
             return clip_path
     
-    def _build_shared_context(self, product_name: str, master_description: str, tone: str) -> str:
+    def _build_shared_context(self, product_name: str, master_description: str) -> str:
         """Build shared context paragraph for all prompts"""
-        tone_style = {
-            "UGC": "authentic user-generated content style, casual and relatable",
-            "premium": "luxury commercial style, sophisticated and elegant",
-            "playful": "fun and energetic style, vibrant and engaging"
-        }.get(tone, "authentic user-generated content style")
+        # FORCED UGC TONE
+        tone_style = "authentic user-generated content style, casual and relatable"
         
         return f"""You are generating a 12-shot viral video ad for {product_name}. 
 Master visual description: {master_description}
-Style: {tone_style}
-Maintain consistent lighting, color grade, and product appearance throughout all 12 shots.
-Keep the same setting, characters, and visual continuity across the entire sequence."""
-
+Style: {tone_style}.
+Visual Language: Handheld phone camera aesthetic, natural lighting, real-life texture. 
+Avoid: Oversaturated colors, fake 3D renders, studio lighting, corporate feel.
+Subject: A consistent creator/user interacting with the product in a real environment.
+"""
