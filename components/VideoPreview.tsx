@@ -10,15 +10,20 @@ interface VideoPreviewProps {
 export default function VideoPreview({ adGeneration }: VideoPreviewProps) {
   const [progress, setProgress] = useState(0)
 
-  // Calculate progress based on clips
   useEffect(() => {
     if (adGeneration.status === 'completed') {
       setProgress(100)
     } else if (adGeneration.clips && adGeneration.clips.length > 0) {
       const completedCount = adGeneration.clips.filter((c: any) => c.status === 'completed').length
-      const totalClips = adGeneration.clips.length || 12 // Default to 12 if not set
-      const calculatedProgress = Math.round((completedCount / totalClips) * 100)
-      setProgress(calculatedProgress)
+      const totalClips = adGeneration.clips.length
+      
+      // Calculate progress based on clips (0-90%)
+      const clipProgress = totalClips > 0 ? (completedCount / totalClips) * 90 : 0
+      
+      // Add a little extra if currently assembling
+      const assembleProgress = adGeneration.status === 'assembling' ? 5 : 0
+      
+      setProgress(Math.round(clipProgress + assembleProgress))
     } else {
       setProgress(5) // Start at 5% if processing but no clips yet
     }
@@ -32,7 +37,12 @@ export default function VideoPreview({ adGeneration }: VideoPreviewProps) {
       {adGeneration.status !== 'completed' && adGeneration.status !== 'failed' && (
         <div className="mb-8">
           <div className="flex justify-between text-sm text-gray-600 mb-2">
-            <span>Generating Scenes...</span>
+            <span>
+                {adGeneration.status === 'assembling' 
+                    ? 'Stitching Video...' 
+                    : `Generating Scenes (${adGeneration.clips?.filter((c:any) => c.status === 'completed').length || 0}/${adGeneration.clips?.length || 12})`
+                }
+            </span>
             <span>{progress}%</span>
           </div>
           <div className="w-full bg-gray-200 rounded-full h-4 overflow-hidden">
@@ -41,16 +51,24 @@ export default function VideoPreview({ adGeneration }: VideoPreviewProps) {
                style={{ width: `${progress}%` }}
              ></div>
           </div>
-          <div className="mt-4 grid grid-cols-4 gap-2">
+          
+          {/* Status Dots */}
+          <div className="mt-4 grid grid-cols-6 sm:grid-cols-12 gap-2">
             {adGeneration.clips?.map((clip: any, idx: number) => (
-               <div key={idx} className={`h-1.5 rounded-full ${
+               <div 
+                 key={idx} 
+                 title={`Scene ${idx+1}: ${clip.status}`}
+                 className={`h-2 rounded-full transition-colors duration-300 ${
                  clip.status === 'completed' ? 'bg-green-500' : 
-                 clip.status === 'generating' ? 'bg-indigo-400 animate-pulse' : 'bg-gray-200'
+                 clip.status === 'generating' ? 'bg-indigo-400 animate-pulse' : 
+                 clip.status === 'failed' ? 'bg-red-500' : 
+                 'bg-gray-200'
                }`} />
             ))}
           </div>
+          
           <p className="text-center text-sm text-gray-500 mt-4">
-            This may take 3-5 minutes. Please don't close this tab.
+            This process generates 12 unique video clips. It typically takes 5-10 minutes.
           </p>
         </div>
       )}
@@ -74,15 +92,16 @@ export default function VideoPreview({ adGeneration }: VideoPreviewProps) {
             <a
               href={`http://localhost:8000${adGeneration.final_video_url}`}
               download
-              className="inline-flex items-center px-6 py-3 border border-transparent text-base font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700"
+              className="inline-flex items-center px-6 py-3 border border-transparent text-base font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 shadow-md transition-all hover:scale-105"
             >
               Download Video
             </a>
           </div>
         </div>
       ) : adGeneration.status === 'failed' ? (
-        <div className="text-center text-red-600 p-4 bg-red-50 rounded-lg">
-          <p>Generation failed. Please try again.</p>
+        <div className="text-center text-red-600 p-6 bg-red-50 rounded-lg border border-red-200">
+          <p className="font-semibold">Generation failed.</p>
+          <p className="text-sm mt-2">Please check the console logs for details or try again.</p>
         </div>
       ) : null}
     </div>

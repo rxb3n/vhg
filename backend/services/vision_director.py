@@ -41,13 +41,8 @@ class VisionDirector:
     async def analyze_and_script(self, image_path: str) -> Dict[str, Any]:
         """Analyze product image and generate 12-scene script"""
         
-        # Check cache first
-        image_hash = self._get_image_hash(image_path)
-        cache_path = f"cache/scripts/{image_hash}.json"
-        
-        if os.path.exists(cache_path):
-            with open(cache_path, 'r') as f:
-                return json.load(f)
+        # --- CACHING DISABLED TO FORCE 12 SCENES ---
+        # We bypass the cache read to ensure we don't pick up old 1-scene scripts
         
         # Read and encode image
         with open(image_path, 'rb') as f:
@@ -61,9 +56,13 @@ class VisionDirector:
         else:
             raise Exception("No vision API key configured. Please set GEMINI_API_KEY or OPENAI_API_KEY")
         
-        # Cache the result
+        # Enforce UGC tone
+        script['tone'] = 'UGC'
+        
+        # Save to cache just for reference/debugging, but don't read from it above
         os.makedirs("cache/scripts", exist_ok=True)
-        with open(cache_path, 'w') as f:
+        # We use a static filename or hash to overwrite old bad cache
+        with open(f"cache/scripts/last_run.json", 'w') as f:
             json.dump(script, f, indent=2)
         
         return script
@@ -81,18 +80,17 @@ class VisionDirector:
         
         system_prompt = """You are an expert TikTok Content Strategist. 
 Analyze the product image and generate a script for a viral, authentic UGC (User Generated Content) video.
-The video must be exactly 60 seconds, broken down into 12 scenes of 5 seconds each.
+The video must be exactly 60 seconds, broken down into EXACTLY 12 SCENES of 5 seconds each.
 
-STRICT VISUAL STYLE GUIDE:
+STRICT VISUAL STYLE GUIDE (UGC ONLY):
 All scenes MUST follow this exact visual formula to ensure consistency:
-"Vertical 9:16 video of a [person matching target audience] in a [bright, aesthetic setting like a bathroom/kitchen/living room] holding the [Product Name] close to the camera, talking directly to the viewer like a TikTok creator. They say '[Short Line matching the scene role]', while [action like applying/showing texture/pointing] and smiling at the camera. Soft natural daylight, clean white and pastel background, subtle text on screen: '[Key Benefit/Hook]'. Handheld phone style, authentic UGC testimonial vibe, smooth 5-second clip, high-definition, readable label on the product."
+"Vertical 9:16 video of a [person matching target audience] in a [bright, natural setting] holding the [Product Name] close to the camera. They say '[Short Line matching the scene role]', while [action like applying/showing texture] and smiling at the camera. Soft natural daylight, clean background, subtle text on screen: '[Key Benefit]'. Handheld phone style, authentic UGC testimonial vibe, smooth 5-second clip, high-definition."
 
 Rules:
-1. Extract the exact product name, type, and physical details (color, material) from the image.
-2. Structure the 12 scenes to tell a story: Hook (1-3) -> Problem (4-6) -> Solution/Demo (7-9) -> Social Proof/CTA (10-12).
-3. Ensure strict visual continuity: same actor, same setting, same lighting in every prompt.
-4. The 'prompt' field in the JSON must be the full, detailed generation prompt following the style guide above.
-5. Return ONLY valid JSON."""
+1. Extract product name and details from the image.
+2. Create EXACTLY 12 scenes.
+3. Scene 1-3: Hook. Scene 4-6: Problem. Scene 7-9: Solution. Scene 10-12: CTA.
+4. Output valid JSON only."""
 
         prompt = f"""{system_prompt}
 
@@ -103,12 +101,12 @@ Return a JSON object with:
   "scenes": [
     {{
       "id": 1,
-      "action": "short description of action",
+      "role": "hook",
       "prompt": "Vertical 9:16 video of a young woman in a bright bathroom holding a...",
-      "role": "hook|problem|solution|proof|CTA",
       "shot_type": "medium close-up",
       "continuity_constraints": "same actor, bright bathroom setting"
-    }}
+    }},
+    ... (Ensure 12 scenes total) ...
   ]
 }}"""
 
@@ -141,7 +139,6 @@ Return a JSON object with:
             
             try:
                 script = json.loads(content)
-                # Enforce tone
                 script['tone'] = 'UGC'
                 return script
             except json.JSONDecodeError:
@@ -166,13 +163,12 @@ Return a JSON object with:
         
         system_prompt = """You are an expert TikTok Content Strategist. 
 Analyze the product image and generate a script for a viral, authentic UGC (User Generated Content) video.
-The video must be exactly 60 seconds, broken down into 12 scenes of 5 seconds each.
+The video must be exactly 60 seconds, broken down into EXACTLY 12 SCENES of 5 seconds each.
 
 STRICT VISUAL STYLE GUIDE:
 All scenes MUST follow this exact visual formula to ensure consistency:
 "Vertical 9:16 video of a [person matching target audience] in a [bright, aesthetic setting like a bathroom/kitchen/living room] holding the [Product Name] close to the camera, talking directly to the viewer like a TikTok creator. They say '[Short Line matching the scene role]', while [action like applying/showing texture/pointing] and smiling at the camera. Soft natural daylight, clean white and pastel background, subtle text on screen: '[Key Benefit/Hook]'. Handheld phone style, authentic UGC testimonial vibe, smooth 5-second clip, high-definition, readable label on the product."
 """
-        # ... (rest of OpenAI logic similar to Gemini, ensuring strict JSON output)
         
         response = self.openai_client.chat.completions.create(
             model="gpt-4o",
